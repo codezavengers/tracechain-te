@@ -36,12 +36,6 @@ export const ENV_VARS: Record<Chain, { url: string; key: string }> = {
 
 const ETHERSCAN_V2_BASE = "https://api.etherscan.io/v2/api"
 const BLOCKSTREAM_BASE = "https://blockstream.info/api"
-// TronGrid is a public gateway to a Tron full node. An API key raises rate
-// limits but is optional, so Tron is live-capable out of the box (like BTC).
-const TRONGRID_BASE = "https://api.trongrid.io"
-
-// Canonical USDT (TRC-20) contract on Tron — prioritized in Tron token traces.
-export const TRON_USDT_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
 
 export interface ChainConfig {
   chain: Chain
@@ -92,18 +86,7 @@ export function getChainConfig(chain: Chain): ChainConfig {
     }
   }
 
-  if (chain === "tron") {
-    // Public TronGrid gateway by default; API key optional (raises rate limit).
-    return {
-      chain,
-      baseUrl: legacyUrl || TRONGRID_BASE,
-      apiKey: legacyKey,
-      configured: true,
-      kind: "explorer",
-    }
-  }
-
-  // Anything else — live only if a full url+key pair is provided.
+  // Tron (and anything else) — live only if a full url+key pair is provided.
   return {
     chain,
     baseUrl: legacyUrl,

@@ -87,14 +87,15 @@ export interface AddressValidation {
   reason: string
 }
 
-// Whether a movement is the chain's native asset or a token (ERC-20 etc).
+// Phase 9 — every normalized movement is either a native-asset transfer or a
+// token (ERC-20/BEP-20/TRC-20) transfer.
 export type TransferType = "NATIVE" | "TOKEN"
 
-// Honest provenance for a fiat value attached to a transfer.
-//   LIVE_PRICE       - spot price fetched now
-//   HISTORICAL_PRICE - price at the transaction's block time
-//   UNAVAILABLE      - no reliable price (value is null, never 0)
-//   MOCK_PRICE       - demo/seeded value, not a real market price
+// Phase 10 — honest provenance for any USD value attached to a movement.
+//   LIVE_PRICE       - spot price captured at fetch time
+//   HISTORICAL_PRICE - price anchored to the transaction's block timestamp
+//   UNAVAILABLE      - no reliable price (usdValue MUST be null, never 0)
+//   MOCK_PRICE       - deterministic demo price (demo data only)
 export type PriceDataSource = "LIVE_PRICE" | "HISTORICAL_PRICE" | "UNAVAILABLE" | "MOCK_PRICE"
 
 export interface Transaction {
@@ -104,35 +105,48 @@ export interface Transaction {
   to: string
   amount: number // native units for BTC/ETH etc, or token units
   asset: string
-  // null when no reliable price exists. NEVER 0-as-unknown (0 would read as a
-  // verified zero-value transfer). Demo data carries a numeric MOCK price.
+  // USD value is null when no reliable price exists. Zero is NOT used as
+  // "unknown" because it would masquerade as a verified $0 movement.
   usdValue: number | null
   timestamp: string
   blockHeight: number
   direction?: "in" | "out"
   provenance: DataProvenance
-  // Phase 9 — unified normalization fields (optional for back-compat).
+  // Phase 9 normalization fields (optional for backward compatibility with
+  // demo fixtures that predate the unified layer).
   transferType?: TransferType
   tokenAddress?: string | null
-  // Phase 10 — value enrichment provenance.
+  // Phase 10 value-enrichment provenance.
   priceDataSource?: PriceDataSource
   priceTimestamp?: string | null
 }
 
-// Phase 11 — result of blockchain (chain) detection for an address.
+// Phase 11 — result of resolving which chain(s) an address may belong to.
 export type ChainDetectionMethod = "FORMAT" | "PROVIDER_PROBE" | "USER_SELECTED"
 
 export interface ChainDetectionResult {
   address: string
-  valid: boolean
   possibleChains: Chain[]
   detectedChain: Chain | null
-  // 0..1 — 1 for an unambiguous format or a confirmed provider probe.
-  confidence: number
+  confidence: number // 0..1
   method: ChainDetectionMethod
-  // True when several chains are plausible and a user must pick one.
-  ambiguous: boolean
+  // True when the format is ambiguous (e.g. any EVM chain) and the operator
+  // must pick the network explicitly.
+  requiresUserSelection: boolean
   reason: string
+}
+
+// Phase 12 — health snapshot for a single chain provider.
+export type ProviderHealthStatus = "HEALTHY" | "DEGRADED" | "RATE_LIMITED" | "UNAVAILABLE" | "DEMO"
+
+export interface ProviderHealth {
+  chain: Chain
+  provider: string
+  status: ProviderHealthStatus
+  latencyMs: number | null
+  lastSuccess: string | null
+  configured: boolean
+  mode: "LIVE" | "DEMO"
 }
 
 export interface WalletMetadata {

@@ -1,105 +1,49 @@
 // Resilient HTTP layer for blockchain provider adapters.
 //
 // Responsibilities:
-//   - Configurable request timeouts (AbortController)
-//   - Retry with exponential backoff + jitter for RETRYABLE failures only
-//   - Rate-limit awareness (HTTP 429 + Retry-After header) with a dedicated code
+//   - Request timeouts (AbortController)
+//   - Retry with exponential backoff + jitter for transient failures
+//   - Rate-limit awareness (HTTP 429 + Retry-After header)
 //   - Typed, human-readable errors so callers can decide to fall back to MOCK
 //
 // This module NEVER logs or exposes API keys. Callers build fully-formed URLs
-// (with the key already appended from a server-side env var) and pass them in;
-// any key-shaped query param is redacted before it can appear in an error.
-
-// Canonical error taxonomy surfaced to callers and (safely) to the frontend.
-export type ProviderErrorKind =
-  | "timeout"
-  | "rate_limited"
-  | "not_configured"
-  | "network"
-  | "http"
-  | "invalid_response"
-  | "unsupported"
+// (with the key already appended from a server-side env var) and pass them in.
 
 export class ProviderError extends Error {
   constructor(
     message: string,
-    readonly kind: ProviderErrorKind,
+    readonly kind: "timeout" | "rate_limit" | "http" | "network" | "parse" | "not_configured",
     readonly status?: number,
-    // Milliseconds the upstream asked us to wait (from Retry-After), if any.
-    readonly retryAfterMs?: number,
   ) {
     super(message)
     this.name = "ProviderError"
-  }
-
-  // Stable, machine-readable code for API responses (never leaks internals).
-  get code(): string {
-    return `provider_${this.kind}`
-  }
-
-  get retryable(): boolean {
-    return isRetryableKind(this.kind, this.status)
   }
 }
 
 export interface FetchOptions {
   timeoutMs?: number
-  // Number of RETRIES after the initial attempt (total attempts = retries + 1).
   retries?: number
   headers?: Record<string, string>
-  method?: string
-  body?: string
   // A label used only for error messages (never includes secrets).
   label?: string
 }
 
-// Phase 5: default request timeout.
-export const DEFAULT_TIMEOUT_MS = 10_000
-// Phase 3: configurable maximum retries (attempts = retries + 1).
-export const DEFAULT_RETRIES = 3
-// Backoff base — 500ms → 1s → 2s → ... (matches the documented ramp).
-export const BACKOFF_BASE_MS = 500
-export const MAX_BACKOFF_MS = 8_000
-
-// Retryable HTTP statuses (transient). Everything else 4xx is terminal.
-const RETRYABLE_STATUS = new Set([408, 429, 500, 502, 503, 504])
-// Explicitly non-retryable client errors (documented for clarity).
-const NON_RETRYABLE_STATUS = new Set([400, 401, 403, 404])
-
-export function isRetryableStatus(status: number): boolean {
-  if (RETRYABLE_STATUS.has(status)) return true
-  if (NON_RETRYABLE_STATUS.has(status)) return false
-  // Any other 5xx is transient; any other 4xx is terminal.
-  return status >= 500
-}
-
-function isRetryableKind(kind: ProviderErrorKind, status?: number): boolean {
-  switch (kind) {
-    case "timeout":
-    case "rate_limited":
-    case "network":
-      return true
-    case "http":
-      return status ? isRetryableStatus(status) : false
-    default:
-      return false
-  }
-}
+const DEFAULT_TIMEOUT_MS = 8000
+const DEFAULT_RETRIES = 2
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms))
 }
 
-// Exponential backoff with full jitter, capped.
-export function backoffDelay(attempt: number): number {
-  const base = Math.min(BACKOFF_BASE_MS * 2 ** attempt, MAX_BACKOFF_MS)
-  const jitter = Math.floor(Math.random() * (base * 0.25))
-  return base + jitter
+function backoffDelay(attempt: number): number {
+  // Exponential backoff: 300ms, 600ms, 1200ms ... with up to 200ms jitter.
+  const base = 300 * 2 ** attempt
+  return base + Math.floor(Math.random() * 200)
 }
 
 // Redact anything that looks like a key/token from a URL before it ever
 // appears in an error message.
-export function safeUrl(url: string): string {
+function safeUrl(url: string): string {
   try {
     const u = new URL(url)
     for (const secretParam of ["apikey", "apiKey", "api_key", "key", "token", "access_token"]) {
@@ -111,25 +55,12 @@ export function safeUrl(url: string): string {
   }
 }
 
-function parseRetryAfter(res: Response): number | undefined {
-  const raw = res.headers.get("retry-after")
-  if (!raw) return undefined
-  // Retry-After may be seconds or an HTTP date.
-  const secs = Number(raw)
-  if (Number.isFinite(secs) && secs >= 0) return secs * 1000
-  const date = Date.parse(raw)
-  if (Number.isFinite(date)) return Math.max(0, date - Date.now())
-  return undefined
-}
-
-async function fetchWithTimeout(url: string, timeoutMs: number, opts: FetchOptions): Promise<Response> {
+async function fetchWithTimeout(url: string, timeoutMs: number, headers?: Record<string, string>): Promise<Response> {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), timeoutMs)
   try {
     return await fetch(url, {
-      method: opts.method ?? "GET",
-      body: opts.body,
-      headers: { accept: "application/json", ...opts.headers },
+      headers: { accept: "application/json", ...headers },
       signal: controller.signal,
       cache: "no-store",
     })
@@ -138,9 +69,7 @@ async function fetchWithTimeout(url: string, timeoutMs: number, opts: FetchOptio
   }
 }
 
-// Core resilient JSON fetch. Throws a typed ProviderError on final failure.
-// Never silently hides failures: after exhausting retries the last typed error
-// is thrown so the service layer can record the reason and fall back honestly.
+// Core resilient JSON fetch. Throws a typed ProviderError on failure.
 export async function fetchJson<T = unknown>(url: string, opts: FetchOptions = {}): Promise<T> {
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS
   const retries = opts.retries ?? DEFAULT_RETRIES
@@ -150,43 +79,47 @@ export async function fetchJson<T = unknown>(url: string, opts: FetchOptions = {
 
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
-      const res = await fetchWithTimeout(url, timeoutMs, opts)
+      const res = await fetchWithTimeout(url, timeoutMs, opts.headers)
 
-      // Phase 4 — rate limited. Respect Retry-After when present, else back off.
+      // Rate limited — respect Retry-After when present, otherwise back off.
       if (res.status === 429) {
-        const retryAfterMs = parseRetryAfter(res)
-        lastErr = new ProviderError(`${label} rate-limited (429).`, "rate_limited", 429, retryAfterMs)
+        const retryAfter = Number(res.headers.get("retry-after"))
+        const waitMs = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : backoffDelay(attempt)
+        lastErr = new ProviderError(`${label} rate-limited (429).`, "rate_limit", 429)
         if (attempt < retries) {
-          await sleep(retryAfterMs ?? backoffDelay(attempt))
+          await sleep(waitMs)
+          continue
+        }
+        throw lastErr
+      }
+
+      // Retry 5xx (transient upstream failures).
+      if (res.status >= 500) {
+        lastErr = new ProviderError(`${label} upstream error (${res.status}).`, "http", res.status)
+        if (attempt < retries) {
+          await sleep(backoffDelay(attempt))
           continue
         }
         throw lastErr
       }
 
       if (!res.ok) {
-        const retryable = isRetryableStatus(res.status)
-        const err = new ProviderError(`${label} request failed (${res.status}).`, "http", res.status)
-        if (retryable && attempt < retries) {
-          lastErr = err
-          await sleep(backoffDelay(attempt))
-          continue
-        }
-        // Terminal 4xx (400/401/403/404/...) — do not retry, bubble up.
-        throw err
+        // 4xx (other than 429) are not retryable.
+        throw new ProviderError(`${label} request failed (${res.status}).`, "http", res.status)
       }
 
       try {
         return (await res.json()) as T
       } catch {
-        // Malformed body is not retryable — the request itself succeeded.
-        throw new ProviderError(`${label} returned a malformed response.`, "invalid_response", res.status)
+        throw new ProviderError(`${label} returned a malformed response.`, "parse")
       }
     } catch (err) {
       if (err instanceof ProviderError) {
-        if (!err.retryable) throw err
+        // Non-retryable errors bubble up immediately.
+        if (err.kind === "http" && err.status && err.status < 500 && err.status !== 429) throw err
+        if (err.kind === "parse") throw err
         lastErr = err
       } else if (err instanceof DOMException && err.name === "AbortError") {
-        // Phase 5 — timeout classification.
         lastErr = new ProviderError(`${label} timed out after ${timeoutMs}ms.`, "timeout")
       } else {
         lastErr = new ProviderError(
@@ -195,7 +128,7 @@ export async function fetchJson<T = unknown>(url: string, opts: FetchOptions = {
         )
       }
       if (attempt < retries) {
-        await sleep(lastErr.retryAfterMs ?? backoffDelay(attempt))
+        await sleep(backoffDelay(attempt))
         continue
       }
     }

@@ -1,12 +1,6 @@
 import type { AddressValidation, Chain, Transaction } from "@/lib/types"
 import { validateAddress } from "@/lib/blockchain/address-utils"
-import type {
-  BlockchainProvider,
-  DataSource,
-  TokenTransfer,
-  TxQueryOptions,
-  WalletBalance,
-} from "@/lib/blockchain/data-source"
+import type { BlockchainProvider, DataSource, TokenTransfer, WalletBalance } from "@/lib/blockchain/data-source"
 
 // Shared base for every chain adapter. Provides structural address validation
 // and a consistent `isConfigured` default; concrete adapters implement the
@@ -24,7 +18,7 @@ export abstract class AbstractProvider implements BlockchainProvider {
     return validateAddress(address, chain ?? this.chain)
   }
 
-  abstract getTransactions(address: string, chain?: Chain, options?: TxQueryOptions): Promise<Transaction[]>
+  abstract getTransactions(address: string, chain?: Chain): Promise<Transaction[]>
   abstract getTransaction(hash: string, chain?: Chain): Promise<Transaction | null>
   abstract getWalletBalance(address: string, chain?: Chain): Promise<WalletBalance>
   abstract getTokenTransfers(address: string, chain?: Chain): Promise<TokenTransfer[]>
